@@ -189,7 +189,7 @@ void cleanup() {
 }
 
 void main_term(int sig) {
-	cleanup();
+	exit(0);
 }
 
 void *commander_ctrl(void *sock_p) {

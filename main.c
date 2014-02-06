@@ -51,7 +51,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define DIR_SOCKETS	"/run/openrc/sockrund"
 //#define ENV_SVCNAME	"RC_SVCNAME"
 #define SOCKET_BACKLOG	5
-#define PATH_CTRLSOCK	DIR_SOCKETS"/"SVC_MYNAME".sock"
+#define PATH_CTRLSOCK	DIR_SOCKETS"/"SVC_MYNAME".ctrlsock"
+#define MAX_COMMANDERS	16
 
 /* === portability hacks === */
 
@@ -61,7 +62,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 /* === global variables === */
 
-int ctrlsock = 0;
+int ctrlsock        = 0;
+int commander_count = 0;
 
 /* === code self === */
 
@@ -78,6 +80,8 @@ int sock_prepare(const char const *path) {
 	sock = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sock == -1)
 		return -1;
+
+	unlink(path);
 
 	if (bind(sock, (struct sockaddr *)&sock_addr, sock_addr_len))
 		return -1;
@@ -184,12 +188,55 @@ void cleanup() {
 	return;
 }
 
+void main_term(int sig) {
+	cleanup();
+}
+
+void *commander_ctrl(void *sock_p) {
+	char cmd[BUFSIZ+1];
+	int sock = *(int *)sock_p;
+
+	while (sock) {
+		int events;
+		fd_set rfds;
+		size_t rbytes;
+
+		FD_ZERO(&rfds);
+		FD_SET(sock, &rfds);
+		events = select(sock+1, &rfds, NULL, NULL, NULL);
+
+		if (events < 0)
+			break;
+
+		if (!events)
+			continue;
+
+		rbytes = read(sock, cmd, BUFSIZ+1);
+
+		if (rbytes <= 0)	/* got error, or connection closed */
+			break;
+
+		if (rbytes >= BUFSIZ+1) /* too long command */
+			break;
+
+		printf("CMD: %s\n", cmd);
+	}
+
+	close(sock);
+	*(int *)sock_p = 0;
+	return NULL;
+}
+
 int main(int argc, char *argv[]) {
 	{ /* initializating cleanup function */
 		if (atexit(cleanup)) {
 			fprintf(stderr, "Got error while atexit(): %s.\n", strerror(errno));
 			exit(errno);
 		}
+		signal(SIGTERM,	main_term);
+		signal(SIGABRT,	main_term);
+		signal(SIGINT,	main_term);
+		signal(SIGQUIT,	main_term);
 	}
 
 	{ /* checking and preparing some stuff */
@@ -205,6 +252,45 @@ int main(int argc, char *argv[]) {
 		ctrlsock = sock_prepare(PATH_CTRLSOCK);
 		if(ctrlsock == -1) {
 			fprintf(stderr, "Cannot create/listen an UNIX socket by path \""PATH_CTRLSOCK"\": %s.\n", strerror(errno));
+			exit(errno);
+		}
+	}
+
+	while (ctrlsock) {
+		int i;
+		int events;
+		int commander;
+		fd_set rfds;
+		pthread_t commander_th[MAX_COMMANDERS] = {0};
+
+		FD_ZERO(&rfds);
+		FD_SET(ctrlsock, &rfds);
+		events = select(ctrlsock+1, &rfds, NULL, NULL, NULL);
+
+		if (events < 0)
+			break;
+
+		if (!events)
+			continue;
+
+		i=0;
+		while (i < commander_count) {
+			if (!commander_th[i] || (pthread_kill(commander_th[i], 0) == ESRCH)) {
+				void *ret;
+				pthread_join(commander_th[i], &ret);
+				memcpy(&commander_th[i], &commander_th[--commander_count], sizeof(*commander_th));
+			}
+			i++;
+		}
+
+		commander = accept(ctrlsock, NULL, NULL);
+		if (commander_count >= MAX_COMMANDERS) {
+			close(commander);
+			continue;
+		}
+
+		if (pthread_create(&commander_th[commander_count++], NULL, commander_ctrl, &commander)) {
+			fprintf(stderr, "Cannot create a thread to control the cmd-socket: %s.\n", strerror(errno));
 			exit(errno);
 		}
 	}

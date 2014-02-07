@@ -33,7 +33,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 /* === includes === */
 
 #include <stdio.h>	/* fprintf()		*/
-#include <stdlib.h>	/* atservice_exit()		*/
+#include <stdlib.h>	/* atservice_exit()	*/
 #include <string.h>	/* strerror()		*/
 #include <pthread.h>	/* pthread_create()	*/
 #include <unistd.h>	/* execve()		*/
@@ -44,6 +44,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <sys/un.h>	/* struct sockaddr_un	*/
 #include <sys/wait.h>	/* waitpid()		*/
 #include <sys/ptrace.h>	/* ptrace()		*/
+#include <search.h>	/* hsearch()		*/
 
 /* === configuration === */
 
@@ -51,8 +52,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define DIR_SOCKETS	"/run/openrc/sockrund"
 //#define ENV_SVCNAME	"RC_SVCNAME"
 #define SOCKET_BACKLOG	5
-#define PATH_CTRLSOCK	DIR_SOCKETS"/"SVC_MYNAME".ctrlsock"
+#define PATH_CTRLSOCK	DIR_SOCKETS"/"SVC_MYNAME
 #define MAX_COMMANDERS	16
+#define MAX_SERVICES	(1<<16)
+#define MAX_SERVICENAME_LENGTH (1<<6)
 
 /* === portability hacks === */
 
@@ -60,12 +63,49 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define PATH_MAX 4096
 #endif
 
+/* === enums === */
+
+typedef enum {
+	SS_FREE = 0,
+	SS_NEW,
+	SS_RUNNED,
+	SS_EXIT,
+} svcstatus_t;
+
+/* === structs === */
+
+typedef struct {
+	int		id;
+	svcstatus_t	status;
+	char		name[MAX_SERVICENAME_LENGTH];
+	pid_t		pid;
+	pthread_t	thread;
+} service_t;
+
 /* === global variables === */
 
 int ctrlsock        = 0;
 int commander_count = 0;
+int svc_count       = 0;
+int svc_nextnum     = 0;
+static service_t svcs[MAX_SERVICES] = {{0}};
+pthread_mutex_t hsearch_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* === code self === */
+
+/* - hsearch - */
+
+static inline ENTRY *hsearch_safe(ENTRY search_req, ACTION action) {
+	ENTRY *search_res_p;
+
+	pthread_mutex_lock(&hsearch_mutex);
+	search_res_p = hsearch(search_req, action);
+	pthread_mutex_unlock(&hsearch_mutex);
+
+	return search_res_p;
+}
+
+/* - sock - */
 
 int sock_prepare(const char const *path) {
 	int sock;
@@ -92,14 +132,69 @@ int sock_prepare(const char const *path) {
 	return sock;
 }
 
-int service_run(const char const *svc_name, char *argv[]) {
+/* - service - */
+
+service_t *service_new(char *svc_name, const pid_t svc_pid) {
+	service_t *svc;
+	int svc_nextnum_old;
+	int svc_id;
+	ENTRY item;
+
+	svc_nextnum_old = svc_nextnum;
+
+	while (svcs[svc_nextnum++].status != SS_FREE) {
+		if (svcs[svc_nextnum-1].status == SS_EXIT) {
+			/* cleanup */
+
+			void *exitcode;
+			int svc_id;
+			service_t *svc;
+			ENTRY item;
+
+			svc_id = svc_nextnum-1;
+			svc = &svcs[svc_id];
+
+			item.key  = svc->name;
+			item.data = NULL;
+			hsearch_safe(item, ENTER);
+			pthread_join(svcs[svc_id].thread, &exitcode);
+
+			memset(svc, 0, sizeof(*svc));
+			break;
+		}
+
+		if (svc_nextnum >= MAX_SERVICES)
+			svc_nextnum = 0;
+
+		if (svc_nextnum == svc_nextnum_old)
+			return NULL;
+	}
+
+	svc_id = svc_nextnum-1;
+
+	svc = &svcs[svc_id];
+	svc->id     = svc_id;
+	svc->status = SS_NEW;
+	svc->pid    = svc_pid;
+
+	svc_name[MAX_SERVICENAME_LENGTH] = 0;
+	strcpy(svc->name, svc_name);
+
+	item.key  = svc->name;
+	item.data = svc;
+	hsearch_safe(item, ENTER);
+
+	return svc;
+}
+
+int service_limpet(service_t *svc) {
 	pthread_t		sock_ctrl_th	=  0;
 	int			sock		=  0;
 	char			sock_path[PATH_MAX];
 
-	sprintf(sock_path, DIR_SOCKETS"/%s.sock", svc_name);	/* TODO: check svc_name length */
+	sprintf(sock_path, DIR_SOCKETS"/%s", svc->name);	/* TODO: check svc->name length */
 
-	#define service_exit(exitcode) { service_cleanup(); return exitcode; }
+	#define service_exit(exitcode) { service_cleanup(); svc->status = SS_EXIT; return exitcode; }
 	inline void service_cleanup()
 	{
 		if (sock) {
@@ -151,32 +246,77 @@ int service_run(const char const *svc_name, char *argv[]) {
 	}
 
 	{ /* running the process */
-		pid_t pid;
+		int child_status;
 
-		pid = fork();
+		ptrace(PTRACE_SYSCALL, svc->pid, 0, 0);
 
-		if (pid == -1) {
-			fprintf(stderr, "Got error while fork()-ing: %s.\n", strerror(errno));
-			service_exit(errno);
-		}
-
-		if (pid == 0) { /* the child */
-			ptrace(PTRACE_TRACEME, 0, 0, 0);	/* waiting while ptrace()-ing started */
-			argv++;
-			execvp(argv[0], argv);
-			service_exit(EXIT_FAILURE);		/* exec never returns :) */
-		} else {	/* the parent */
-			int child_status;
-
-			ptrace(PTRACE_SYSCALL, pid, 0, 0);
-
-			waitpid(pid, &child_status, 0);
-			service_exit(WEXITSTATUS(child_status));
-		}
+		waitpid(svc->pid, &child_status, 0);
+		printf("test\n");
+		service_exit(WEXITSTATUS(child_status));
+		printf("test2\n");
 	}
 
 	service_exit(EXIT_FAILURE);	/* this's unreachable line */
 }
+
+int service_attach(char *svc_name, const pid_t svc_pid) {
+	service_t *svc = service_new(svc_name, svc_pid);
+	if (svc == NULL)
+		return -1;
+
+	return pthread_create(&svc->thread, NULL, (void *(*)(void *))service_limpet, svc);
+}
+
+int service_run(char *svc_name, char *argv[]) {
+	pid_t svc_pid;
+
+	{ /* running the process */
+		svc_pid = fork();
+
+		if (svc_pid == -1) {
+			return errno;
+		}
+
+		if (svc_pid == 0) { /* the child */
+			ptrace(PTRACE_TRACEME, 0, 0, 0);	/* waiting while ptrace()-ing started */
+			argv++;
+			execvp(argv[0], argv);
+			exit(EXIT_FAILURE);			/* exec never returns :) */
+		}
+	}
+
+	service_t *svc = service_new(svc_name, svc_pid);
+	if (svc == NULL)
+		return -1;
+
+	return pthread_create(&svc->thread, NULL, (void *(*)(void *))service_limpet, svc);
+}
+
+service_t *service_byname(char *svc_name) {
+	ENTRY *search_res_p, search_req = {svc_name, NULL};
+
+	search_res_p = hsearch_safe(search_req, FIND);
+
+	if (search_res_p == NULL)
+		return NULL;
+
+	return search_res_p->data;
+}
+
+int service_finish(service_t *svc) {
+	return kill(svc->pid, SIGTERM);
+}
+
+int service_down(char *svc_name) {
+	service_t *svc = service_byname(svc_name);
+
+	if (svc == NULL)
+		return EINVAL;
+
+	return service_finish(svc);
+}
+
+/* - main - */
 
 void cleanup() {
 	if (ctrlsock) {
@@ -193,7 +333,7 @@ void main_term(int sig) {
 }
 
 void *commander_ctrl(void *sock_p) {
-	char cmd[BUFSIZ+1];
+	char cmd[BUFSIZ+2], *ptr;
 	int sock = *(int *)sock_p;
 
 	while (sock) {
@@ -219,7 +359,37 @@ void *commander_ctrl(void *sock_p) {
 		if (rbytes >= BUFSIZ+1) /* too long command */
 			break;
 
-		printf("CMD: %s\n", cmd);
+		cmd[rbytes] = 0;
+
+		ptr = &cmd[1];
+		switch(*cmd) {
+			case 'a': {	/* supervise new service, attaching by pid */
+				char *svc_name;
+				int ret;
+				pid_t svc_pid;
+				if(sscanf(ptr, "%u", &svc_pid) < 1)
+					continue;
+
+				while(*(ptr++) > 0x20);
+
+				svc_name = ptr;
+				if ((ret = service_attach(svc_name, svc_pid)))
+					dprintf(sock, "Error: %i\n", ret);
+				break;
+			}
+			case 'd': {	/* deattach/delete/down a service */
+				char *svc_name;
+				int ret;
+
+				svc_name = ptr;
+				if ((ret = service_down(svc_name)))
+					dprintf(sock, "Error: %i\n", ret);
+			}
+			default:	/* unknown command */
+				fprintf(stderr, "Unknown command: %s\n", cmd);
+				break;
+		}
+
 	}
 
 	close(sock);
@@ -246,6 +416,8 @@ int main(int argc, char *argv[]) {
 				exit(errno);
 			}
 		}
+
+		hcreate(MAX_SERVICES*2);
 	}
 
 	{ /* preparing the socket */
@@ -256,7 +428,7 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	while (ctrlsock) {
+	while (ctrlsock) { /* the "infinite" loop */
 		int i;
 		int events;
 		int commander;
@@ -295,6 +467,7 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
+	hdestroy();
 	exit(0);
 }
 

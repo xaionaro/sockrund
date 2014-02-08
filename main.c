@@ -194,7 +194,8 @@ int service_limpet(service_t *svc) {
 
 	sprintf(sock_path, DIR_SOCKETS"/%s", svc->name);	/* TODO: check svc->name length */
 
-	#define service_exit(exitcode) { service_cleanup(); svc->status = SS_EXIT; return exitcode; }
+	#define service_exit(exitcode) { service_cleanup(); svc->status = SS_EXIT; printf("%i exit: %s\n", svc->pid, strerror(exitcode)); return exitcode; }
+	#define ptrace_safe(...) if (errno=0, ptrace(__VA_ARGS__) == -1 && errno) service_exit(errno)
 	inline void service_cleanup()
 	{
 		if (sock) {
@@ -248,12 +249,40 @@ int service_limpet(service_t *svc) {
 	{ /* running the process */
 		int child_status;
 
-		ptrace(PTRACE_SYSCALL, svc->pid, 0, 0);
+		printf("test3\n");
+		ptrace_safe(PTRACE_ATTACH, svc->pid)
 
-		waitpid(svc->pid, &child_status, 0);
 		printf("test\n");
+		if (waitpid(svc->pid, &child_status, 0) == -1 && errno)
+			service_exit(errno);
+
+		printf("test4\n");
+		ptrace_safe(PTRACE_SETOPTIONS, svc->pid, NULL, PTRACE_O_TRACEFORK|PTRACE_O_TRACEEXIT);
+
+		printf("test5\n");
+		while (1) {
+			printf("iteration\n");
+
+			ptrace_safe(PTRACE_CONT, svc->pid, NULL, WSTOPSIG(child_status));
+
+			printf("iteration 2\n");
+
+			if (waitpid(svc->pid, &child_status, WCONTINUED) == -1)
+				service_exit(errno);
+
+			printf("iteration 3\n");
+			if (child_status >> 16 == PTRACE_EVENT_FORK) {
+				int newpid, cchild_status;
+				printf("sdf\n");
+				ptrace_safe(PTRACE_GETEVENTMSG, svc->pid, NULL, (long)&newpid);
+				printf("ddff\n");
+				ptrace_safe(PTRACE_DETACH, newpid, NULL, NULL);
+				printf("Attached to offspring %ld\n", newpid);  
+			} else
+			if (child_status >> 16 == PTRACE_EVENT_FORK)
+				printf("Child exited: %ld\n", svc->pid);  
+		}
 		service_exit(WEXITSTATUS(child_status));
-		printf("test2\n");
 	}
 
 	service_exit(EXIT_FAILURE);	/* this's unreachable line */

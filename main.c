@@ -49,14 +49,17 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 /* === configuration === */
 
-#define SVC_MYNAME	"sockrund"
-#define DIR_SOCKETS	"/run/openrc/sockrund"
-//#define ENV_SVCNAME	"RC_SVCNAME"
-#define SOCKET_BACKLOG	5
-#define PATH_CTRLSOCK	DIR_SOCKETS"/"SVC_MYNAME
-#define MAX_COMMANDERS	16
-#define MAX_SERVICES	(1<<12)
-#define MAX_SERVICENAME_LENGTH (1<<6)
+#define SVC_MYNAME			"sockrund"
+#define DIR_SOCKETS			"/run/openrc/sockrund"
+//#define ENV_SVCNAME			"RC_SVCNAME"
+#define SOCKET_BACKLOG			5
+#define PATH_CTRLSOCK			DIR_SOCKETS"/"SVC_MYNAME
+#define MAX_COMMANDERS			16
+#define MAX_SERVICES			(1<<10)
+#define MAX_SERVICENAME_LENGTH 		(1<<6)
+#define MAX_WATCHEDPIDS			(1<<16)
+#define MAX_WATCHEDPIDS_PERSERVICE	(1<<5)
+#define INTERVAL_CLEANUP		60
 
 /* === portability hacks === */
 
@@ -79,24 +82,40 @@ typedef struct {
 	int		id;
 	svcstatus_t	status;
 	char		name[MAX_SERVICENAME_LENGTH];
-	pid_t		pid;
+	pid_t		pid[MAX_WATCHEDPIDS_PERSERVICE];
+	int		pid_count;
 	int		sock;
 	pthread_t	sock_thread;
 } service_t;
 
+typedef struct {
+	pid_t		pid;
+	service_t	*svc;
+} pidsvc_t;
+
 /* === global variables === */
 
-int verbosity       = LOG_DEBUG;
-int ctrlsock        = 0;
-int commander_count = 0;
-int svc_count       = 0;
-int svc_nextnum     = 0;
-int sockdir_fd      = 0;
+int time_lastcleanup = 0;
+int verbosity        = LOG_DEBUG;
+int ctrlsock         = 0;
+int commander_count  = 0;
+int svc_count        = 0;
+int svc_nextnum      = 0;
+int sockdir_fd       = 0;
+int pid_count        = 0;
+int pid_nextnum      = 0;
 static service_t svcs[MAX_SERVICES] = {{0}};
 void *tsearch_pid2svc_bt = NULL;
 pthread_mutex_t tsearch_pid2svc_mutex	= PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t hsearch_mutex		= PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t ptrace_mutex		= PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  ptrace_mutex_cond	= PTHREAD_COND_INITIALIZER;
+pidsvc_t item_pid2svc[MAX_WATCHEDPIDS]	= {{0}};
+
+/* === protos === */
+
+extern service_t *service_bypid(pid_t svc_pid);
+extern int service_exit(service_t *svc, int exitcode);
 
 /* === code self === */
 
@@ -110,55 +129,83 @@ pthread_mutex_t ptrace_mutex		= PTHREAD_MUTEX_INITIALIZER;
 #define log(level, ...) if (unlikely(level <= verbosity)) fprintf(stderr, __VA_ARGS__);
 //syslog(level,  __VA_ARGS__)
 
+/* - compar - */
+
+int compar_pidsvc_pid(const void *a, const void *b) {
+	return ((pidsvc_t *)a)->pid - ((pidsvc_t *)b)->pid;
+}
+
 /* - ptrace - */
 
-#define ptrace_svc(request, svc, ...) {\
+#define ptrace_safe(errcode, ...) {\
 	errno=0;\
-	if (unlikely(ptrace(request, svc->pid, ## __VA_ARGS__) == -1))\
+	if (unlikely(ptrace(__VA_ARGS__) == -1))\
 		if (likely(errno)) {\
-			log(LOG_EMERG, "Got error while ptrace(%i, %i, ...): %s.\n", request, svc->pid, strerror(errno));\
+			log(LOG_EMERG, "Got error while ptrace(): %s. (#0)\n", strerror(errno));\
+			errcode;\
+		}\
+}
+
+#define ptrace_svc_parent(request, svc, ...) {\
+	errno=0;\
+	if (unlikely(ptrace(request, svc->pid[0], ## __VA_ARGS__) == -1))\
+		if (likely(errno)) {\
+			log(LOG_EMERG, "Got error while ptrace(%i, %i, ...): %s. (#1)\n", request, svc->pid[0], strerror(errno));\
 			return service_exit(svc, errno);\
 		}\
 }
 
+int ptrace_error(service_t *svc, pid_t pid) {
+	return service_exit(svc, -1);
+}
+
 int ptrace_ctrl(void *arg)
 {
-#if 0
 	while (1) {
-		siginfo_t winfo;
+//		siginfo_t winfo;
+		service_t *svc;
+		pid_t child_pid;
+		int child_status;
 
 		if (!svc_count) { /* if there're no children */
 			/* wait until ptrace_mutex will be unlocked */
-			pthread_mutex_lock(&ptrace_mutex);
-			pthread_mutex_unlock(&ptrace_mutex);
+			log(LOG_DEBUG, "ptrace_ctrl(): Waiting for children.\n");
+			pthread_cond_wait(&ptrace_mutex_cond, &ptrace_mutex);
 		}
 
-		if (waitid(P_ALL, 0, &winfo, WSTOPPED) == -1) {
+		log(LOG_DEBUG, "ptrace_ctrl(): Waiting for event.\n");
+		//if (waitid(P_ALL, 0, &winfo, WSTOPPED|WEXITED|WCONTINUED) == -1) {
+		child_pid = waitpid(svcs[0].pid[0], &child_status, WCONTINUED);
+		if (child_pid == -1) {
 			if (errno == ECHILD) {
-				log(LOG_DEBUG, "There're no children, but waitid() was been called.\n");
+				log(LOG_DEBUG, "There're no children, but waitpid() was been called.\n");
 				svc_count = 0;
 				continue;
 			}
 
-			log(LOG_EMERG, "Got error while waitid(): %s. Exit.\n", strerror(errno));
+			log(LOG_EMERG, "Got error while waitpid(): %s. Exit.\n", strerror(errno));
 			exit(errno);
 		}
 
-		log(LOG_DEBUG, "iteration 3\n");
-		if (winfo.si_status >> 16 == PTRACE_EVENT_FORK) {
-			int newpid;
-			log(LOG_DEBUG, "sdf\n");
-			ptrace_svc(PTRACE_GETEVENTMSG, winfo.si_pid, NULL, (long)&newpid);
-			log(LOG_DEBUG, "ddff\n");
-			ptrace_svc(PTRACE_DETACH, newpid, NULL, NULL);
-			log(LOG_DEBUG, "Attached to offspring %d\n", newpid);  
-		} else
-		if (winfo.si_status >> 16 == PTRACE_EVENT_FORK)
-			log(LOG_DEBUG, "Child exited: %d\n", winfo.si_pid);
+		svc = service_bypid(child_pid);
+		if (svc == NULL) {
+			log(LOG_ALERT, "Cannot find service by pid %d in internal list.\n", child_pid);
+			continue;
+		}
+		log(LOG_DEBUG, "ptrace_ctrl(): Recieved an event from \"%s\" (pid: %d).\n", svc->name, child_pid);
 
-		ptrace_svc(PTRACE_CONT, winfo.si_pid, NULL, WSTOPSIG(winfo.si_status));
+		if (child_status >> 16 == PTRACE_EVENT_FORK) {
+			int newpid;
+			log(LOG_DEBUG, "ptrace_ctrl(): \"%s\" a fork()\n", svc->name);
+			ptrace_safe(ptrace_error(svc, child_pid), PTRACE_GETEVENTMSG, child_pid, NULL, (long)&newpid);
+			log(LOG_DEBUG, "ptrace_ctrl(): \"%s\" fork()-ed: %d -> %d\n", svc->name, child_pid, newpid);
+			ptrace_safe(ptrace_error(svc, newpid), PTRACE_DETACH, newpid, NULL, NULL);
+		} else
+		if (child_status >> 16 == PTRACE_EVENT_FORK)
+			log(LOG_DEBUG, "ptrace_ctrl(): \"%s\" closed pid %d\n", svc->name, child_pid);
+
+		ptrace_safe(ptrace_error(svc, child_pid), PTRACE_CONT, child_pid, NULL, WSTOPSIG(child_status));
 	}
-#endif
 	return 0;
 }
 
@@ -173,6 +220,130 @@ static inline ENTRY *hsearch_safe(ENTRY search_req, ACTION action)
 	pthread_mutex_unlock(&hsearch_mutex);
 
 	return search_res_p;
+}
+
+/* - pid - */
+
+int pid_register(pid_t pid, service_t *svc) {
+	pidsvc_t *item_pid2svc_p;
+#ifdef PARANOID
+	int pid_nextnum_old;
+#endif
+
+	if (pid_count >= MAX_WATCHEDPIDS) {
+		log(LOG_ALERT, "There's no more space left to store information about PIDs (#0).\n");
+		return ENOMEM;
+	}
+
+	if (svc->pid_count >= MAX_WATCHEDPIDS_PERSERVICE) {
+		log(LOG_ALERT, "There's no more space left to store information about PIDs of service \"%s\".\n", svc->name);
+		return ENOMEM;
+	}
+
+#ifdef PARANOID
+	pid_nextnum_old = pid_nextnum;
+#endif
+	while (item_pid2svc[pid_nextnum].pid) {
+		pid_nextnum++;
+
+		if (pid_nextnum >= MAX_WATCHEDPIDS)
+			pid_nextnum = 0;
+#ifdef PARANOID
+		if (pid_nextnum == pid_nextnum_old) {
+			log(LOG_ALERT, "There's no more space left to store information about PIDs (#1).\n");
+			return ENOMEM;
+		}
+#endif
+	}
+
+	{ /* storing the record about pid into binary tree */
+		char *res;
+		item_pid2svc_p = &item_pid2svc[pid_nextnum];
+		item_pid2svc_p->pid  = pid;
+		item_pid2svc_p->svc  = svc;
+
+		res = tsearch(item_pid2svc_p, &tsearch_pid2svc_bt, compar_pidsvc_pid);
+
+		if (*(void **)res != item_pid2svc_p) { /* that means the record was already exists */
+			log(LOG_NOTICE, "The record for pid %d is already exist (the error appeared while working on \"%s\").\n", pid, svc->name);
+			memset(item_pid2svc_p, 0, sizeof(*item_pid2svc_p));
+			return EEXIST;
+		}
+	}
+
+	log(LOG_DEBUG, "Registered a new pid: %d -> %s (%d).\n", pid, svc->name, svc->pid_count);
+	svc->pid[svc->pid_count++] = pid;
+
+	pid_count++;
+	return 0;
+}
+
+int pid_unregister(pid_t pid, service_t *svc) {
+	void *res;
+	int i;
+	pidsvc_t item_pid2svc, *item_pid2svc_res_p;
+
+	item_pid2svc.pid  = pid;
+
+	res = tfind(&item_pid2svc, &tsearch_pid2svc_bt, compar_pidsvc_pid); /* TODO: remove double-searching through the BT */
+	if (res == NULL) {
+		log(LOG_NOTICE, "Cannot find pid %d in internal list. (#0)\n", pid);
+		return ESRCH;
+	}
+
+	item_pid2svc_res_p = *(void **)res;
+	memset(item_pid2svc_res_p, 0, sizeof(*item_pid2svc_res_p));
+
+	tdelete(&item_pid2svc, &tsearch_pid2svc_bt, compar_pidsvc_pid);
+
+	pid_count--;
+
+	i = 0;
+	while (i < svc->pid_count) {
+		if (svc->pid[i] == pid) {
+			svc->pid[i] = svc->pid[ --svc->pid_count ];
+			return 0;
+		}
+		i++;
+	}
+
+	log(LOG_ERR, "Error: Cannot find pid %d in list of \"%s\".\n", pid, svc->name);
+	return ESRCH;
+}
+
+int pid_unregister_service(service_t *svc) {
+	if (svc == NULL)
+		return EINVAL;
+
+	log(LOG_DEBUG, "Unregistering all pids of \"%s\"\n", svc->name)
+
+	if (!svc->pid_count) {
+		log(LOG_NOTICE, "There's no pids attached to \"%s\". (#0)\n", svc->name)
+		return 0;
+	}
+
+	while (svc->pid_count--) {
+		void *res;
+
+		pidsvc_t item_pid2svc, *item_pid2svc_res_p;
+
+		item_pid2svc.pid  = svc->pid[svc->pid_count];
+
+		res = tfind(&item_pid2svc, &tsearch_pid2svc_bt, compar_pidsvc_pid); /* TODO: remove double-searching through the BT */
+		if (res == NULL) {
+			log(LOG_NOTICE, "Cannot find pid %d in internal list. Service \"%s\".\n", svc->pid[svc->pid_count], svc->name);
+			continue;
+		}
+
+		item_pid2svc_res_p = *(void **)res;
+		memset(item_pid2svc_res_p, 0, sizeof(*item_pid2svc_res_p));
+
+		tdelete(&item_pid2svc, &tsearch_pid2svc_bt, compar_pidsvc_pid);
+
+		pid_count--;
+	}
+
+	return 0;
 }
 
 /* - sock - */
@@ -225,14 +396,36 @@ void *sock_ctrl(service_t *svc)
 		close(client);
 	}
 
+	log(LOG_DEBUG, "sock_ctrl() exit\n");
 	return NULL;
 }
 
 /* - service - */
 
+int service_detach(service_t *svc) {
+	int i;
+
+	if (svc == NULL)
+		return EINVAL;
+
+	log(LOG_DEBUG, "Detaching all pids of \"%s\"\n", svc->name)
+
+	if (!svc->pid_count) {
+		log(LOG_NOTICE, "There's no pids attached to \"%s\". (#1)\n", svc->name)
+		return 0;
+	}
+
+	i = 0;
+	while (i < svc->pid_count)
+		ptrace_safe(NULL, PTRACE_DETACH, svc->pid[i++]);
+
+	return 0;
+}
+
 static inline void service_cleanup(service_t *svc)
 {
 	if (svc->sock) {
+		log(LOG_DEBUG, "Removing the socket of \"%s\"\n", svc->name);
 		close(svc->sock);
 		unlink(svc->name);
 		svc->sock = 0;
@@ -241,46 +434,50 @@ static inline void service_cleanup(service_t *svc)
 	return;
 }
 
-static inline int service_exit(service_t *svc, int exitcode)
+int service_exit(service_t *svc, int exitcode)
 {
 	switch (svc->status) {
 		case SS_FREE:
 		case SS_EXIT:
 			break;
 		default:
+			service_detach(svc);
+			pid_unregister_service(svc);
+
 			service_cleanup(svc);
 			svc->status = SS_EXIT;
-			log(LOG_DEBUG, "%i exit: %s\n", svc->pid, strerror(exitcode));
+			log(LOG_DEBUG, "exit: %s\n", strerror(exitcode));
 			svc_count--;
 	}
 	return exitcode;
 }
 
-service_t *service_new(char *svc_name, const pid_t svc_pid)
+service_t *service_new(char *svc_name)
 {
-	service_t *svc;
+	time_t time_cur = time(NULL);
+	char istimetocleanup = (time_cur - time_lastcleanup > INTERVAL_CLEANUP);
 	int svc_nextnum_old;
-	int svc_id;
-	ENTRY item;
 
 	svc_nextnum_old = svc_nextnum;
 
-	while (svcs[svc_nextnum++].status != SS_FREE) {
+	if (svc_count >= MAX_SERVICES) {
+		log(LOG_ALERT, "There's no more space left to store information about running services (#0).\n");
+		return NULL;
+	}
+
+	/* getting actual "svc_nextnum" and cleaning up after finished services */
+	while ((svcs[svc_nextnum++].status != SS_FREE) || istimetocleanup) {
 		if (svcs[svc_nextnum-1].status == SS_EXIT) {
 			/* cleanup */
 
 			void *exitcode;
 			int svc_id;
 			service_t *svc;
-			ENTRY item_name2svc; //, item_pid2svc;
+			ENTRY item_name2svc;
 
 			svc_id = svc_nextnum-1;
 			svc = &svcs[svc_id];
-/*
-			item_pid2svc.key  = (void *)(long)svc_pid;
-			item_pid2svc.data = NULL;
-			tdelete(&item_pid2svc, &tsearch_pid2svc_bt, );
-*/
+
 			item_name2svc.key  = svc->name;
 			item_name2svc.data = NULL;
 			hsearch_safe(item_name2svc, ENTER);
@@ -293,30 +490,43 @@ service_t *service_new(char *svc_name, const pid_t svc_pid)
 		if (svc_nextnum >= MAX_SERVICES)
 			svc_nextnum = 0;
 
-		if (svc_nextnum == svc_nextnum_old)
+		if (svc_nextnum == svc_nextnum_old) {
+			if (istimetocleanup) {
+				time_lastcleanup = time_cur;
+				istimetocleanup  = 0;
+				continue;
+			}
+			log(LOG_ALERT, "There's no more space left to store information about running services (#1).\n");
 			return NULL;
+		}
 	}
 
-	svc_id = svc_nextnum-1;
+	{ /* preparing new service info structure and metadata*/
 
-	svc = &svcs[svc_id];
-	svc->id     = svc_id;
-	svc->status = SS_NEW;
-	svc->pid    = svc_pid;
+		service_t *svc;
+		int svc_id;
+		ENTRY item;
 
-	svc_name[MAX_SERVICENAME_LENGTH] = 0;
-	strcpy(svc->name, svc_name);
+		svc_id = svc_nextnum-1;
 
-	item.key  = svc->name;
-	item.data = svc;
-	hsearch_safe(item, ENTER);
+		svc = &svcs[svc_id];
+		svc->id     = svc_id;
+		svc->status = SS_NEW;
 
-	svc_count++;
-	return svc;
+		svc_name[MAX_SERVICENAME_LENGTH] = 0;
+		strcpy(svc->name, svc_name);
+
+		item.key  = svc->name;
+		item.data = svc;
+		hsearch_safe(item, ENTER);
+
+		svc_count++;
+		return svc;
+	}
 }
 
 int service_attach(char *svc_name, const pid_t svc_pid) {
-	service_t 	*svc 		= service_new(svc_name, svc_pid);
+	service_t 	*svc 		= service_new(svc_name);
 
 	if (svc == NULL)
 		return -1;
@@ -338,21 +548,28 @@ int service_attach(char *svc_name, const pid_t svc_pid) {
 
 	{ /* clinging to the process */
 		int child_status;
+		int res;
+
+		/* remembering the pid */
+
+		res = pid_register(svc_pid, svc);
+		if (res) return service_exit(svc, res);
 
 		/* setting up catching of forks and exits */
 
-		log(LOG_DEBUG, "attaching to %d\n", svc->pid);
-		ptrace_svc(PTRACE_ATTACH, svc);
-		if (waitpid(svc->pid, &child_status, 0) == -1 && errno)
+		log(LOG_DEBUG, "attaching to %d\n", svc_pid);
+		ptrace_svc_parent(PTRACE_ATTACH, svc);
+		if (waitpid(svc_pid, &child_status, 0) == -1 && errno)
 			return service_exit(svc, errno);
-		ptrace_svc(PTRACE_SETOPTIONS, svc, NULL, PTRACE_O_TRACEFORK|PTRACE_O_TRACEEXIT);
+		ptrace_svc_parent(PTRACE_SETOPTIONS, svc, NULL, PTRACE_O_TRACEFORK|PTRACE_O_TRACEEXIT);
 
 		/* unhalting the process */
 
-		ptrace_svc(PTRACE_CONT, svc, NULL, WSTOPSIG(child_status));
+		ptrace_svc_parent(PTRACE_CONT, svc, NULL, SIGCONT);
+		//ptrace_svc_parent(PTRACE_CONT, svc, NULL, WSTOPSIG(child_status));
 
 		/* now the process is monitored by ptrace_ctrl() thread, so unlocking it (if it's locked) */
-		pthread_mutex_unlock(&ptrace_mutex);
+		pthread_cond_broadcast(&ptrace_mutex_cond);
 	}
 
 	return 0;
@@ -383,14 +600,35 @@ service_t *service_byname(char *svc_name) {
 
 	search_res_p = hsearch_safe(search_req, FIND);
 
-	if (search_res_p == NULL)
+	if (search_res_p == NULL) {
+		errno = ESRCH;
 		return NULL;
+	}
+
+	if (search_res_p->data == NULL)
+		errno = ESRCH;
 
 	return search_res_p->data;
 }
 
+service_t *service_bypid(pid_t svc_pid) {
+	void *res;
+	pidsvc_t item_pid2svc, *item_pid2svc_res_p;
+	item_pid2svc.pid  = svc_pid;
+
+	res = tfind(&item_pid2svc, &tsearch_pid2svc_bt, compar_pidsvc_pid);
+	if (res == NULL) {
+		errno = ESRCH;
+		return NULL;
+	}
+
+	item_pid2svc_res_p = *(void **)res;
+
+	return item_pid2svc_res_p->svc;
+}
+
 int service_finish(service_t *svc) {
-	return kill(svc->pid, SIGTERM);
+	return kill(svc->pid[0], SIGTERM);
 }
 
 int service_down(char *svc_name) {
@@ -515,11 +753,11 @@ int main(int argc, char *argv[]) {
 		}
 
 		hcreate(MAX_SERVICES*2);
+
+		time_lastcleanup = time(NULL);
 	}
 
 	{ /* running the monitoring thread */
-		pthread_mutex_lock(&ptrace_mutex);	/* hold on ptrace_ctrl until any child appear */
-
 		if (pthread_create(&ptrace_ctrl_thread, NULL, (void *(*)(void *))ptrace_ctrl, NULL)) {
 			log(LOG_EMERG, "pthread_create() error: %s.\n", strerror(errno));
 			exit(errno);

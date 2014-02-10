@@ -11,8 +11,8 @@ CFLAGS ?= -march=native -pipe -O2 -std=c99
 CFLAGS += $(CSECFLAGS) $(STDFLAG)
 DEBUGCFLAGS ?= -pipe -Wall -Werror -ggdb3 -Wno-error=unused-variable $(CSECFLAGS)
 
-LDSECFLAGS ?= -Xlinker -zrelro -pthread
-LDFLAGS += $(LDSECFLAGS)
+LDSECFLAGS ?= -Xlinker -zrelro
+LDFLAGS += $(LDSECFLAGS) -pthread
 
 INSTDIR = $(DESTDIR)$(PREFIX)
 
@@ -22,6 +22,9 @@ main.o\
 binary=sockrund
 
 #.PHONY: doc
+
+debug:
+	$(CC) $(DEBUGCFLAGS) $(LDFLAGS) $(INC) main.c -o $(binary)
 
 all: $(objs)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(objs) $(LIBS) -o $(binary)

@@ -33,6 +33,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 /* === includes === */
 
 #include <stdio.h>	/* fprintf()		*/
+#include <syslog.h>	/* syslog()		*/
 #include <stdlib.h>	/* atservice_exit()	*/
 #include <string.h>	/* strerror()		*/
 #include <pthread.h>	/* pthread_create()	*/
@@ -54,7 +55,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define SOCKET_BACKLOG	5
 #define PATH_CTRLSOCK	DIR_SOCKETS"/"SVC_MYNAME
 #define MAX_COMMANDERS	16
-#define MAX_SERVICES	(1<<16)
+#define MAX_SERVICES	(1<<12)
 #define MAX_SERVICENAME_LENGTH (1<<6)
 
 /* === portability hacks === */
@@ -79,23 +80,92 @@ typedef struct {
 	svcstatus_t	status;
 	char		name[MAX_SERVICENAME_LENGTH];
 	pid_t		pid;
-	pthread_t	thread;
+	int		sock;
+	pthread_t	sock_thread;
 } service_t;
 
 /* === global variables === */
 
+int verbosity       = LOG_DEBUG;
 int ctrlsock        = 0;
 int commander_count = 0;
 int svc_count       = 0;
 int svc_nextnum     = 0;
+int sockdir_fd      = 0;
 static service_t svcs[MAX_SERVICES] = {{0}};
-pthread_mutex_t hsearch_mutex = PTHREAD_MUTEX_INITIALIZER;
+void *tsearch_pid2svc_bt = NULL;
+pthread_mutex_t tsearch_pid2svc_mutex	= PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t hsearch_mutex		= PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t ptrace_mutex		= PTHREAD_MUTEX_INITIALIZER;
 
 /* === code self === */
 
+/* - macro - */
+
+#define   likely(x) __builtin_expect((x), 1)
+#define unlikely(x) __builtin_expect((x), 0)
+
+/* - log - */
+
+#define log(level, ...) if (unlikely(level <= verbosity)) fprintf(stderr, __VA_ARGS__);
+//syslog(level,  __VA_ARGS__)
+
+/* - ptrace - */
+
+#define ptrace_svc(request, svc, ...) {\
+	errno=0;\
+	if (unlikely(ptrace(request, svc->pid, ## __VA_ARGS__) == -1))\
+		if (likely(errno)) {\
+			log(LOG_EMERG, "Got error while ptrace(%i, %i, ...): %s.\n", request, svc->pid, strerror(errno));\
+			return service_exit(svc, errno);\
+		}\
+}
+
+int ptrace_ctrl(void *arg)
+{
+#if 0
+	while (1) {
+		siginfo_t winfo;
+
+		if (!svc_count) { /* if there're no children */
+			/* wait until ptrace_mutex will be unlocked */
+			pthread_mutex_lock(&ptrace_mutex);
+			pthread_mutex_unlock(&ptrace_mutex);
+		}
+
+		if (waitid(P_ALL, 0, &winfo, WSTOPPED) == -1) {
+			if (errno == ECHILD) {
+				log(LOG_DEBUG, "There're no children, but waitid() was been called.\n");
+				svc_count = 0;
+				continue;
+			}
+
+			log(LOG_EMERG, "Got error while waitid(): %s. Exit.\n", strerror(errno));
+			exit(errno);
+		}
+
+		log(LOG_DEBUG, "iteration 3\n");
+		if (winfo.si_status >> 16 == PTRACE_EVENT_FORK) {
+			int newpid;
+			log(LOG_DEBUG, "sdf\n");
+			ptrace_svc(PTRACE_GETEVENTMSG, winfo.si_pid, NULL, (long)&newpid);
+			log(LOG_DEBUG, "ddff\n");
+			ptrace_svc(PTRACE_DETACH, newpid, NULL, NULL);
+			log(LOG_DEBUG, "Attached to offspring %d\n", newpid);  
+		} else
+		if (winfo.si_status >> 16 == PTRACE_EVENT_FORK)
+			log(LOG_DEBUG, "Child exited: %d\n", winfo.si_pid);
+
+		ptrace_svc(PTRACE_CONT, winfo.si_pid, NULL, WSTOPSIG(winfo.si_status));
+	}
+#endif
+	return 0;
+}
+
 /* - hsearch - */
 
-static inline ENTRY *hsearch_safe(ENTRY search_req, ACTION action) {
+static inline ENTRY *hsearch_safe(ENTRY search_req, ACTION action)
+{
 	ENTRY *search_res_p;
 
 	pthread_mutex_lock(&hsearch_mutex);
@@ -107,7 +177,8 @@ static inline ENTRY *hsearch_safe(ENTRY search_req, ACTION action) {
 
 /* - sock - */
 
-int sock_prepare(const char const *path) {
+int sock_prepare(const char const *path)
+{
 	int sock;
 	size_t sock_addr_len;
 	struct sockaddr_un	sock_addr	= {0};
@@ -132,9 +203,61 @@ int sock_prepare(const char const *path) {
 	return sock;
 }
 
+void *sock_ctrl(service_t *svc)
+{
+	log(LOG_DEBUG, "sock_ctrl(): %i\n", svc->sock);
+	while (svc->sock) {
+		int events;
+		int client;
+		fd_set rfds;
+
+		FD_ZERO(&rfds);
+		FD_SET(svc->sock, &rfds);
+		events = select(svc->sock+1, &rfds, NULL, NULL, NULL);
+
+		if (events < 0)
+			break;
+
+		if (!events)
+			continue;
+
+		client = accept(svc->sock, NULL, NULL);
+		close(client);
+	}
+
+	return NULL;
+}
+
 /* - service - */
 
-service_t *service_new(char *svc_name, const pid_t svc_pid) {
+static inline void service_cleanup(service_t *svc)
+{
+	if (svc->sock) {
+		close(svc->sock);
+		unlink(svc->name);
+		svc->sock = 0;
+	}
+
+	return;
+}
+
+static inline int service_exit(service_t *svc, int exitcode)
+{
+	switch (svc->status) {
+		case SS_FREE:
+		case SS_EXIT:
+			break;
+		default:
+			service_cleanup(svc);
+			svc->status = SS_EXIT;
+			log(LOG_DEBUG, "%i exit: %s\n", svc->pid, strerror(exitcode));
+			svc_count--;
+	}
+	return exitcode;
+}
+
+service_t *service_new(char *svc_name, const pid_t svc_pid)
+{
 	service_t *svc;
 	int svc_nextnum_old;
 	int svc_id;
@@ -149,15 +272,19 @@ service_t *service_new(char *svc_name, const pid_t svc_pid) {
 			void *exitcode;
 			int svc_id;
 			service_t *svc;
-			ENTRY item;
+			ENTRY item_name2svc; //, item_pid2svc;
 
 			svc_id = svc_nextnum-1;
 			svc = &svcs[svc_id];
-
-			item.key  = svc->name;
-			item.data = NULL;
-			hsearch_safe(item, ENTER);
-			pthread_join(svcs[svc_id].thread, &exitcode);
+/*
+			item_pid2svc.key  = (void *)(long)svc_pid;
+			item_pid2svc.data = NULL;
+			tdelete(&item_pid2svc, &tsearch_pid2svc_bt, );
+*/
+			item_name2svc.key  = svc->name;
+			item_name2svc.data = NULL;
+			hsearch_safe(item_name2svc, ENTER);
+			pthread_join(svcs[svc_id].sock_thread, &exitcode);
 
 			memset(svc, 0, sizeof(*svc));
 			break;
@@ -184,116 +311,51 @@ service_t *service_new(char *svc_name, const pid_t svc_pid) {
 	item.data = svc;
 	hsearch_safe(item, ENTER);
 
+	svc_count++;
 	return svc;
 }
 
-int service_limpet(service_t *svc) {
-	pthread_t		sock_ctrl_th	=  0;
-	int			sock		=  0;
-	char			sock_path[PATH_MAX];
+int service_attach(char *svc_name, const pid_t svc_pid) {
+	service_t 	*svc 		= service_new(svc_name, svc_pid);
 
-	sprintf(sock_path, DIR_SOCKETS"/%s", svc->name);	/* TODO: check svc->name length */
-
-	#define service_exit(exitcode) { service_cleanup(); svc->status = SS_EXIT; printf("%i exit: %s\n", svc->pid, strerror(exitcode)); return exitcode; }
-	#define ptrace_safe(...) if (errno=0, ptrace(__VA_ARGS__) == -1 && errno) service_exit(errno)
-	inline void service_cleanup()
-	{
-		if (sock) {
-			close(sock);
-			unlink(sock_path);
-			sock = 0;
-		}
-
-		return;
-	}
-
-	void *sock_ctrl(void *arg)
-	{
-		while (sock) {
-			int events;
-			int client;
-			fd_set rfds;
-
-			FD_ZERO(&rfds);
-			FD_SET(sock, &rfds);
-			events = select(sock+1, &rfds, NULL, NULL, NULL);
-
-			if (events < 0)
-				break;
-
-			if (!events)
-				continue;
-
-			client = accept(sock, NULL, NULL);
-			close(client);
-		}
-
-		return NULL;
-	}
+	if (svc == NULL)
+		return -1;
 
 	{ /* preparing the socket */
-		sock = sock_prepare(sock_path);
-		if(sock == -1) {
-			fprintf(stderr, "Cannot create/listen an UNIX socket by path \"%s\": %s.\n", sock_path, strerror(errno));
-			service_exit(errno);
+		svc->sock       = sock_prepare(svc->name);
+		if (svc->sock == -1) {
+			log(LOG_ALERT, "Cannot create/listen an UNIX socket by path \"%s\" (the last chdir() was to \""DIR_SOCKETS"\"): %s.\n", svc->name, strerror(errno));
+			return service_exit(svc, errno);
 		}
 	}
 
 	{ /* running a thread to accept and drop clients */
-		if (pthread_create(&sock_ctrl_th, NULL, sock_ctrl, NULL)) {
-			fprintf(stderr, "Cannot create a thread to control the socket: %s.\n", strerror(errno));
-			service_exit(errno);
+		if (pthread_create(&svc->sock_thread, NULL, (void *(*)(void *))sock_ctrl, svc)) {
+			log(LOG_ALERT, "Cannot create a thread to control the socket: %s.\n", strerror(errno));
+			return service_exit(svc, errno);
 		}
 	}
 
-	{ /* running the process */
+	{ /* clinging to the process */
 		int child_status;
 
-		printf("test3\n");
-		ptrace_safe(PTRACE_ATTACH, svc->pid)
+		/* setting up catching of forks and exits */
 
-		printf("test\n");
+		log(LOG_DEBUG, "attaching to %d\n", svc->pid);
+		ptrace_svc(PTRACE_ATTACH, svc);
 		if (waitpid(svc->pid, &child_status, 0) == -1 && errno)
-			service_exit(errno);
+			return service_exit(svc, errno);
+		ptrace_svc(PTRACE_SETOPTIONS, svc, NULL, PTRACE_O_TRACEFORK|PTRACE_O_TRACEEXIT);
 
-		printf("test4\n");
-		ptrace_safe(PTRACE_SETOPTIONS, svc->pid, NULL, PTRACE_O_TRACEFORK|PTRACE_O_TRACEEXIT);
+		/* unhalting the process */
 
-		printf("test5\n");
-		while (1) {
-			printf("iteration\n");
+		ptrace_svc(PTRACE_CONT, svc, NULL, WSTOPSIG(child_status));
 
-			ptrace_safe(PTRACE_CONT, svc->pid, NULL, WSTOPSIG(child_status));
-
-			printf("iteration 2\n");
-
-			if (waitpid(svc->pid, &child_status, WCONTINUED) == -1)
-				service_exit(errno);
-
-			printf("iteration 3\n");
-			if (child_status >> 16 == PTRACE_EVENT_FORK) {
-				int newpid, cchild_status;
-				printf("sdf\n");
-				ptrace_safe(PTRACE_GETEVENTMSG, svc->pid, NULL, (long)&newpid);
-				printf("ddff\n");
-				ptrace_safe(PTRACE_DETACH, newpid, NULL, NULL);
-				printf("Attached to offspring %ld\n", newpid);  
-			} else
-			if (child_status >> 16 == PTRACE_EVENT_FORK)
-				printf("Child exited: %ld\n", svc->pid);  
-		}
-		service_exit(WEXITSTATUS(child_status));
+		/* now the process is monitored by ptrace_ctrl() thread, so unlocking it (if it's locked) */
+		pthread_mutex_unlock(&ptrace_mutex);
 	}
 
-	service_exit(EXIT_FAILURE);	/* this's unreachable line */
-}
-
-int service_attach(char *svc_name, const pid_t svc_pid) {
-	service_t *svc = service_new(svc_name, svc_pid);
-	if (svc == NULL)
-		return -1;
-
-	return pthread_create(&svc->thread, NULL, (void *(*)(void *))service_limpet, svc);
+	return 0;
 }
 
 int service_run(char *svc_name, char *argv[]) {
@@ -302,23 +364,18 @@ int service_run(char *svc_name, char *argv[]) {
 	{ /* running the process */
 		svc_pid = fork();
 
-		if (svc_pid == -1) {
+		if (svc_pid == -1)
 			return errno;
-		}
 
 		if (svc_pid == 0) { /* the child */
 			ptrace(PTRACE_TRACEME, 0, 0, 0);	/* waiting while ptrace()-ing started */
 			argv++;
 			execvp(argv[0], argv);
-			exit(EXIT_FAILURE);			/* exec never returns :) */
+			return errno;				/* exec*() never returns on success :) */
 		}
 	}
 
-	service_t *svc = service_new(svc_name, svc_pid);
-	if (svc == NULL)
-		return -1;
-
-	return pthread_create(&svc->thread, NULL, (void *(*)(void *))service_limpet, svc);
+	return service_attach(svc_name, svc_pid);
 }
 
 service_t *service_byname(char *svc_name) {
@@ -348,7 +405,7 @@ int service_down(char *svc_name) {
 /* - main - */
 
 void cleanup() {
-	if (ctrlsock) {
+	if (likely(ctrlsock)) {
 		close(ctrlsock);
 		unlink(PATH_CTRLSOCK);
 		ctrlsock = 0;
@@ -359,6 +416,8 @@ void cleanup() {
 
 void main_term(int sig) {
 	exit(0);
+
+	return;
 }
 
 void *commander_ctrl(void *sock_p) {
@@ -415,7 +474,7 @@ void *commander_ctrl(void *sock_p) {
 					dprintf(sock, "Error: %i\n", ret);
 			}
 			default:	/* unknown command */
-				fprintf(stderr, "Unknown command: %s\n", cmd);
+				log(LOG_NOTICE, "Unknown command: %s\n", cmd);
 				break;
 		}
 
@@ -427,9 +486,11 @@ void *commander_ctrl(void *sock_p) {
 }
 
 int main(int argc, char *argv[]) {
+	pthread_t ptrace_ctrl_thread = 0;
+
 	{ /* initializating cleanup function */
 		if (atexit(cleanup)) {
-			fprintf(stderr, "Got error while atexit(): %s.\n", strerror(errno));
+			log(LOG_EMERG, "Got error while atexit(): %s.\n", strerror(errno));
 			exit(errno);
 		}
 		signal(SIGTERM,	main_term);
@@ -439,20 +500,36 @@ int main(int argc, char *argv[]) {
 	}
 
 	{ /* checking and preparing some stuff */
+		openlog(NULL, LOG_PID|LOG_CONS|LOG_NDELAY, LOG_DAEMON);
+
 		if (mkdir(DIR_SOCKETS, 0700)) {
 			if (errno != EEXIST) {
-				fprintf(stderr, "Cannot create directory \""DIR_SOCKETS"\": %s.\n", strerror(errno));
+				log(LOG_EMERG, "Cannot create directory \""DIR_SOCKETS"\": %s.\n", strerror(errno));
 				exit(errno);
 			}
+		}
+
+		if (chdir(DIR_SOCKETS) == -1) {
+			log(LOG_EMERG, "Cannot open() directory \""DIR_SOCKETS"\": %s.\n", strerror(errno));
+			exit(errno);
 		}
 
 		hcreate(MAX_SERVICES*2);
 	}
 
+	{ /* running the monitoring thread */
+		pthread_mutex_lock(&ptrace_mutex);	/* hold on ptrace_ctrl until any child appear */
+
+		if (pthread_create(&ptrace_ctrl_thread, NULL, (void *(*)(void *))ptrace_ctrl, NULL)) {
+			log(LOG_EMERG, "pthread_create() error: %s.\n", strerror(errno));
+			exit(errno);
+		}
+	}
+
 	{ /* preparing the socket */
 		ctrlsock = sock_prepare(PATH_CTRLSOCK);
-		if(ctrlsock == -1) {
-			fprintf(stderr, "Cannot create/listen an UNIX socket by path \""PATH_CTRLSOCK"\": %s.\n", strerror(errno));
+		if (ctrlsock == -1) {
+			log(LOG_EMERG, "Cannot create/listen an UNIX socket by path \""PATH_CTRLSOCK"\": %s.\n", strerror(errno));
 			exit(errno);
 		}
 	}
@@ -490,13 +567,14 @@ int main(int argc, char *argv[]) {
 			continue;
 		}
 
-		if (pthread_create(&commander_th[commander_count++], NULL, commander_ctrl, &commander)) {
-			fprintf(stderr, "Cannot create a thread to control the cmd-socket: %s.\n", strerror(errno));
+		if (unlikely(pthread_create(&commander_th[commander_count++], NULL, commander_ctrl, &commander))) {
+			log(LOG_EMERG, "Cannot create a thread to control the cmd-socket: %s.\n", strerror(errno));
 			exit(errno);
 		}
 	}
 
 	hdestroy();
+	closelog();
 	exit(0);
 }
 

@@ -139,6 +139,7 @@ extern int service_exit(service_t *svc, int exitcode);
 
 int compar_pidsvc_pid(const void *a, const void *b)
 {
+//	log(LOG_DEBUG, "cmp: %d %d\n", ((pidsvc_t *)a)->pid, ((pidsvc_t *)b)->pid);
 	return ((pidsvc_t *)a)->pid - ((pidsvc_t *)b)->pid;
 }
 
@@ -212,16 +213,18 @@ int pid_unregister(pid_t pid, service_t *svc) {
 	}
 
 	item_pid2svc_res_p = *(void **)res;
-	memset(item_pid2svc_res_p, 0, sizeof(*item_pid2svc_res_p));
-
 	tdelete(&item_pid2svc, &tsearch_pid2svc_bt, compar_pidsvc_pid);
+
+	memset(item_pid2svc_res_p, 0, sizeof(*item_pid2svc_res_p));
 
 	pid_count--;
 
 	i = 0;
 	while (i < svc->pid_count) {
 		if (svc->pid[i] == pid) {
-			svc->pid[i] = svc->pid[ --svc->pid_count ];
+			svc->pid_count--;
+			svc->pid[i] = svc->pid[ svc->pid_count ];
+			log(LOG_DEBUG, "Unregistered the pid: %d -> %s (%d).\n", pid, svc->name, svc->pid_count);
 			return 0;
 		}
 		i++;
@@ -333,14 +336,14 @@ void ptrace_ctrl_sigpoll(int sig)
 int ptrace_ctrl(void *arg)
 {
 	// Configuring signals
-	sigset_t sigset_sighandler;
-	sigemptyset(&sigset_sighandler);
-	sigaddset(&sigset_sighandler, SIGALRM);
-	sigaddset(&sigset_sighandler, SIGHUP);
-	sigaddset(&sigset_sighandler, SIGTERM);
-	sigaddset(&sigset_sighandler, SIGINT);
+	sigset_t sigset;
+	sigemptyset(&sigset);
+	sigaddset(&sigset, SIGALRM);
+	sigaddset(&sigset, SIGHUP);
+	sigaddset(&sigset, SIGTERM);
+	sigaddset(&sigset, SIGINT);
 
-	if (pthread_sigmask(SIG_BLOCK, &sigset_sighandler, NULL))
+	if (pthread_sigmask(SIG_BLOCK, &sigset, NULL))
 		return errno;
 
 	signal(SIGPOLL,  ptrace_ctrl_sigpoll);
@@ -447,9 +450,9 @@ int ptrace_ctrl(void *arg)
 			case PTRACE_EVENT_EXIT: {
 				/* caught an exit */
 				ptrace_safe_continue(PTRACE_CONT, child_pid, NULL, SIGCONT);
-				child_pid = waitpid(-1, &child_status, __WALL);
+				child_pid = waitpid(child_pid, &child_status, 0);
 
-				log(LOG_DEBUG, "ptrace_ctrl(): \"%s\" closed the pid %d\n", svc->name, child_pid);
+				log(LOG_DEBUG, "ptrace_ctrl(): \"%s\" closed the pid %d. pids left: %d.\n", svc->name, child_pid, svc->pid_count-1);
 				pid_unregister(child_pid, svc);
 
 				if (!svc->pid_count)

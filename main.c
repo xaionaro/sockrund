@@ -104,11 +104,16 @@ int svc_nextnum      = 0;
 int sockdir_fd       = 0;
 int pid_count        = 0;
 int pid_nextnum      = 0;
+pid_t ptrace_arg_attachservice_pid      = 0;
+service_t *ptrace_arg_attachservice_svc = NULL;
+service_t *ptrace_arg_detachservice = NULL;
+pthread_t ptrace_ctrl_thread = 0;
 static service_t svcs[MAX_SERVICES] = {{0}};
 void *tsearch_pid2svc_bt = NULL;
 pthread_mutex_t tsearch_pid2svc_mutex	= PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t hsearch_mutex		= PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t ptrace_mutex		= PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t ptrace_send_mutex	= PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  ptrace_mutex_cond	= PTHREAD_COND_INITIALIZER;
 pidsvc_t item_pid2svc[MAX_WATCHEDPIDS]	= {{0}};
 
@@ -123,6 +128,7 @@ extern int service_exit(service_t *svc, int exitcode);
 
 #define   likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
+#define PTRACE_EVENT(proc_status) ((proc_status) >> 16)
 
 /* - log - */
 
@@ -131,95 +137,9 @@ extern int service_exit(service_t *svc, int exitcode);
 
 /* - compar - */
 
-int compar_pidsvc_pid(const void *a, const void *b) {
+int compar_pidsvc_pid(const void *a, const void *b)
+{
 	return ((pidsvc_t *)a)->pid - ((pidsvc_t *)b)->pid;
-}
-
-/* - ptrace - */
-
-#define ptrace_safe(errcode, ...) {\
-	errno=0;\
-	if (unlikely(ptrace(__VA_ARGS__) == -1))\
-		if (likely(errno)) {\
-			log(LOG_EMERG, "Got error while ptrace(): %s. (#0)\n", strerror(errno));\
-			errcode;\
-		}\
-}
-
-#define ptrace_svc_parent(request, svc, ...) {\
-	errno=0;\
-	if (unlikely(ptrace(request, svc->pid[0], ## __VA_ARGS__) == -1))\
-		if (likely(errno)) {\
-			log(LOG_EMERG, "Got error while ptrace(%i, %i, ...): %s. (#1)\n", request, svc->pid[0], strerror(errno));\
-			return service_exit(svc, errno);\
-		}\
-}
-
-int ptrace_error(service_t *svc, pid_t pid) {
-	return service_exit(svc, -1);
-}
-
-int ptrace_ctrl(void *arg)
-{
-	while (1) {
-//		siginfo_t winfo;
-		service_t *svc;
-		pid_t child_pid;
-		int child_status;
-
-		if (!svc_count) { /* if there're no children */
-			/* wait until ptrace_mutex will be unlocked */
-			log(LOG_DEBUG, "ptrace_ctrl(): Waiting for children.\n");
-			pthread_cond_wait(&ptrace_mutex_cond, &ptrace_mutex);
-		}
-
-		log(LOG_DEBUG, "ptrace_ctrl(): Waiting for event.\n");
-		//if (waitid(P_ALL, 0, &winfo, WSTOPPED|WEXITED|WCONTINUED) == -1) {
-		child_pid = waitpid(svcs[0].pid[0], &child_status, WCONTINUED);
-		if (child_pid == -1) {
-			if (errno == ECHILD) {
-				log(LOG_DEBUG, "There're no children, but waitpid() was been called.\n");
-				svc_count = 0;
-				continue;
-			}
-
-			log(LOG_EMERG, "Got error while waitpid(): %s. Exit.\n", strerror(errno));
-			exit(errno);
-		}
-
-		svc = service_bypid(child_pid);
-		if (svc == NULL) {
-			log(LOG_ALERT, "Cannot find service by pid %d in internal list.\n", child_pid);
-			continue;
-		}
-		log(LOG_DEBUG, "ptrace_ctrl(): Recieved an event from \"%s\" (pid: %d).\n", svc->name, child_pid);
-
-		if (child_status >> 16 == PTRACE_EVENT_FORK) {
-			int newpid;
-			log(LOG_DEBUG, "ptrace_ctrl(): \"%s\" a fork()\n", svc->name);
-			ptrace_safe(ptrace_error(svc, child_pid), PTRACE_GETEVENTMSG, child_pid, NULL, (long)&newpid);
-			log(LOG_DEBUG, "ptrace_ctrl(): \"%s\" fork()-ed: %d -> %d\n", svc->name, child_pid, newpid);
-			ptrace_safe(ptrace_error(svc, newpid), PTRACE_DETACH, newpid, NULL, NULL);
-		} else
-		if (child_status >> 16 == PTRACE_EVENT_FORK)
-			log(LOG_DEBUG, "ptrace_ctrl(): \"%s\" closed pid %d\n", svc->name, child_pid);
-
-		ptrace_safe(ptrace_error(svc, child_pid), PTRACE_CONT, child_pid, NULL, WSTOPSIG(child_status));
-	}
-	return 0;
-}
-
-/* - hsearch - */
-
-static inline ENTRY *hsearch_safe(ENTRY search_req, ACTION action)
-{
-	ENTRY *search_res_p;
-
-	pthread_mutex_lock(&hsearch_mutex);
-	search_res_p = hsearch(search_req, action);
-	pthread_mutex_unlock(&hsearch_mutex);
-
-	return search_res_p;
 }
 
 /* - pid - */
@@ -346,6 +266,256 @@ int pid_unregister_service(service_t *svc) {
 	return 0;
 }
 
+/* - ptrace - */
+
+#define ptrace_safe(errcode, request, pid, ...) {\
+	errno=0;\
+	if (unlikely(ptrace(request, pid, ## __VA_ARGS__) == -1))\
+		if (likely(errno)) {\
+			ptrace_error(svc, pid);\
+			errcode;\
+		}\
+}
+
+#define ptrace_safe_return(...)		ptrace_safe(return errno,	__VA_ARGS__)
+#define ptrace_safe_continue(...)	ptrace_safe(continue,		__VA_ARGS__)
+#define ptrace_safe_ignore(...)		ptrace_safe(NULL,		__VA_ARGS__)
+
+int ptrace_error(service_t *svc, pid_t pid)
+{
+	log(LOG_EMERG, "Got error while ptrace(request, %i, ...): %s. (#0)\n", pid, strerror(errno));\
+	return service_exit(svc, errno);
+}
+
+int ptrace_serviceexit(service_t *svc)
+{
+	log(LOG_NOTICE, "Service \"%s\" exited.\n", svc->name);\
+	return 0;
+}
+
+int ptrace_postattach(service_t *svc, pid_t svc_pid)
+{
+	int child_status;
+
+	pid_register(svc_pid, svc);
+
+	/* setting up catching of forks and exits */
+
+	ptrace_safe_return(PTRACE_SETOPTIONS,	svc_pid, NULL, PTRACE_O_TRACEFORK|PTRACE_O_TRACEEXIT);
+
+	/* unhalting the process */
+
+	ptrace_safe_return(PTRACE_CONT,	svc_pid, NULL, WSTOPSIG(child_status));
+	//ptrace_safe(PTRACE_CONT,	svc_pid, NULL, NULL);
+
+	return errno;
+}
+
+int ptrace_detach(service_t *svc) {
+	int i = 0;
+
+
+	while (i < svc->pid_count) {
+		ptrace_safe_ignore(PTRACE_CONT,		svc->pid[i],	NULL, SIGCONT);
+		ptrace_safe_ignore(PTRACE_DETACH,	svc->pid[i]);
+		i++;
+	}
+
+	pid_unregister_service(svc);
+	return 0;
+}
+
+void ptrace_ctrl_sigpoll(int sig)
+{
+	return;
+}
+
+int ptrace_ctrl(void *arg)
+{
+	// Configuring signals
+	sigset_t sigset_sighandler;
+	sigemptyset(&sigset_sighandler);
+	sigaddset(&sigset_sighandler, SIGALRM);
+	sigaddset(&sigset_sighandler, SIGHUP);
+	sigaddset(&sigset_sighandler, SIGTERM);
+	sigaddset(&sigset_sighandler, SIGINT);
+
+	if (pthread_sigmask(SIG_BLOCK, &sigset_sighandler, NULL))
+		return errno;
+
+	signal(SIGPOLL,  ptrace_ctrl_sigpoll);
+
+	while (1) {
+		int errno_waitpid;
+//		siginfo_t winfo;
+		service_t *svc;
+		pid_t child_pid;
+		int child_status;
+
+		log(LOG_DEBUG, "ptrace_ctrl(): Waiting for event.\n");
+		//if (waitid(P_ALL, 0, &winfo, WSTOPPED|WEXITED|WCONTINUED) == -1) {
+		//child_pid = waitpid(svcs[0].pid[0], &child_status, WCONTINUED);
+		child_pid = waitpid(-1, &child_status, __WALL);
+		errno_waitpid = errno;
+		if (child_pid == -1) {
+			switch (errno_waitpid) {
+				case ECHILD:
+					break;
+				default:
+					log(LOG_EMERG, "Got error while waitpid(): %s. Exit.\n", strerror(errno));
+					exit(errno);
+			}
+		}
+
+		if (errno_waitpid == ECHILD) {
+			log(LOG_DEBUG, "There're no children, but waitpid() was been called. Resetting svc_count to zero.\n");
+			svc_count = 0;
+			/* wait until ptrace_mutex will be unlocked */
+			log(LOG_DEBUG, "ptrace_ctrl(): Waiting for children.\n");
+			pthread_cond_wait(&ptrace_mutex_cond, &ptrace_mutex);
+			log(LOG_DEBUG, "ptrace_ctrl(): Hooray! New child: %d.\n", ptrace_arg_attachservice_pid);
+		} else {
+			svc = service_bypid(child_pid);
+
+			if (svc == NULL) {
+				log(LOG_ALERT, "Cannot find service by pid %d in internal list.\n", child_pid);
+				continue;
+			}
+			log(LOG_DEBUG, "ptrace_ctrl(): Recieved an event from \"%s\" (pid: %d).\n", svc->name, child_pid);
+		}
+
+		/* attaching to a new service if that was signalled by an another thread */
+		if (ptrace_arg_attachservice_pid) {
+			/* attaching to the process */
+
+			log(LOG_DEBUG, "attaching to %d\n",	ptrace_arg_attachservice_pid);
+			ptrace_safe_return(PTRACE_ATTACH,	ptrace_arg_attachservice_pid);
+
+			if (waitpid(ptrace_arg_attachservice_pid, &child_status, 0) == -1 && errno) {
+				log(LOG_ALERT, "ptrace_ctrl(): Got error on waitpid() while attaching to new service: %s\n", strerror(errno));
+				service_exit(svc, errno);
+				continue;
+			}
+
+			/* storing information about the process */
+
+			ptrace_postattach(ptrace_arg_attachservice_svc, ptrace_arg_attachservice_pid);
+
+			/* operation complete */
+
+			ptrace_arg_attachservice_pid = 0;
+			ptrace_arg_attachservice_svc = NULL;
+			pthread_cond_broadcast(&ptrace_mutex_cond);
+		}
+
+		/* detaching from a service if that was signalled by an another thread */
+		if (ptrace_arg_detachservice != NULL) {
+			ptrace_detach(ptrace_arg_detachservice);
+			ptrace_arg_detachservice = 0;
+			pthread_cond_broadcast(&ptrace_mutex_cond);
+		}
+
+		if (child_pid <= 0) {
+			log(LOG_DEBUG, "ptrace_ctrl(): child_pid (%i) <= 0.\n", child_pid);
+			continue;
+		}
+
+		switch (PTRACE_EVENT(child_status)) {
+			case 0: {
+				/* caught a signal */
+
+				log(LOG_DEBUG, "ptrace_ctrl(): \"%s\": Got a signal #%i\n", svc->name, WSTOPSIG(child_pid));
+				break;
+			}
+			case PTRACE_EVENT_FORK: {
+				/* caught a fork */
+
+				long _newpid;
+				pid_t newpid;
+
+				log(LOG_DEBUG, "ptrace_ctrl(): \"%s\": a fork(): %d\n", svc->name, child_pid);
+				ptrace_safe_continue(PTRACE_GETEVENTMSG, child_pid,	NULL, &_newpid);
+				newpid = _newpid;
+
+				log(LOG_DEBUG, "ptrace_ctrl(): \"%s\" fork()-ed: %d -> %d\n", svc->name, child_pid, newpid);
+				//ptrace_safe_continue(PTRACE_DETACH,	 newpid,	NULL, NULL);
+				//ptrace_postattach(svc, newpid);
+				pid_register(newpid, svc);
+				ptrace(PTRACE_CONT, newpid, NULL, SIGCONT);
+				break;
+			}
+			case PTRACE_EVENT_EXIT: {
+				/* caught an exit */
+				ptrace_safe_continue(PTRACE_CONT, child_pid, NULL, SIGCONT);
+				child_pid = waitpid(-1, &child_status, __WALL);
+
+				log(LOG_DEBUG, "ptrace_ctrl(): \"%s\" closed the pid %d\n", svc->name, child_pid);
+				pid_unregister(child_pid, svc);
+
+				if (!svc->pid_count)
+					ptrace_serviceexit(svc);
+				continue;
+			}
+			default: {
+				/* caught an unknown event */
+
+				log(LOG_DEBUG, "ptrace_ctrl(): \"%s\": Got an event %i\n", svc->name, PTRACE_EVENT(child_status));
+				break;
+			}
+		}
+
+//		ptrace_safe_continue(PTRACE_CONT, child_pid, NULL, WSTOPSIG(child_status));
+		ptrace_safe_continue(PTRACE_CONT, child_pid, NULL, SIGCONT);
+	}
+	return 0;
+}
+
+static inline void ptrace_ctrl_cmdnotify()
+{
+	pthread_cond_broadcast(&ptrace_mutex_cond);
+	pthread_kill(ptrace_ctrl_thread, SIGPOLL);
+	pthread_cond_wait(&ptrace_mutex_cond, &ptrace_mutex);
+
+	return;
+}
+
+int ptrace_ctrl_attachservice(service_t *svc, pid_t svc_pid)
+{
+	pthread_mutex_lock(&ptrace_send_mutex);
+
+	/* notifing the ptrace_ctrl() thread about new pid to attach */
+	ptrace_arg_attachservice_pid = svc_pid;
+	ptrace_arg_attachservice_svc = svc;
+	ptrace_ctrl_cmdnotify();
+
+	pthread_mutex_unlock(&ptrace_send_mutex);
+	return 0;
+}
+
+int ptrace_ctrl_detachservice(service_t *svc)
+{
+	pthread_mutex_lock(&ptrace_send_mutex);
+
+	ptrace_arg_detachservice = svc;
+	ptrace_ctrl_cmdnotify();
+
+	pthread_mutex_unlock(&ptrace_send_mutex);
+	return 0;
+}
+
+/* - hsearch - */
+
+static inline ENTRY *hsearch_safe(ENTRY search_req, ACTION action)
+{
+	ENTRY *search_res_p;
+
+	pthread_mutex_lock(&hsearch_mutex);
+	search_res_p = hsearch(search_req, action);
+	pthread_mutex_unlock(&hsearch_mutex);
+
+	return search_res_p;
+}
+
 /* - sock - */
 
 int sock_prepare(const char const *path)
@@ -402,9 +572,8 @@ void *sock_ctrl(service_t *svc)
 
 /* - service - */
 
-int service_detach(service_t *svc) {
-	int i;
-
+int service_detach(service_t *svc)
+{
 	if (svc == NULL)
 		return EINVAL;
 
@@ -415,11 +584,7 @@ int service_detach(service_t *svc) {
 		return 0;
 	}
 
-	i = 0;
-	while (i < svc->pid_count)
-		ptrace_safe(NULL, PTRACE_DETACH, svc->pid[i++]);
-
-	return 0;
+	return ptrace_ctrl_detachservice(svc);
 }
 
 static inline void service_cleanup(service_t *svc)
@@ -442,7 +607,6 @@ int service_exit(service_t *svc, int exitcode)
 			break;
 		default:
 			service_detach(svc);
-			pid_unregister_service(svc);
 
 			service_cleanup(svc);
 			svc->status = SS_EXIT;
@@ -546,33 +710,7 @@ int service_attach(char *svc_name, const pid_t svc_pid) {
 		}
 	}
 
-	{ /* clinging to the process */
-		int child_status;
-		int res;
-
-		/* remembering the pid */
-
-		res = pid_register(svc_pid, svc);
-		if (res) return service_exit(svc, res);
-
-		/* setting up catching of forks and exits */
-
-		log(LOG_DEBUG, "attaching to %d\n", svc_pid);
-		ptrace_svc_parent(PTRACE_ATTACH, svc);
-		if (waitpid(svc_pid, &child_status, 0) == -1 && errno)
-			return service_exit(svc, errno);
-		ptrace_svc_parent(PTRACE_SETOPTIONS, svc, NULL, PTRACE_O_TRACEFORK|PTRACE_O_TRACEEXIT);
-
-		/* unhalting the process */
-
-		ptrace_svc_parent(PTRACE_CONT, svc, NULL, SIGCONT);
-		//ptrace_svc_parent(PTRACE_CONT, svc, NULL, WSTOPSIG(child_status));
-
-		/* now the process is monitored by ptrace_ctrl() thread, so unlocking it (if it's locked) */
-		pthread_cond_broadcast(&ptrace_mutex_cond);
-	}
-
-	return 0;
+	return ptrace_ctrl_attachservice(svc, svc_pid);
 }
 
 int service_run(char *svc_name, char *argv[]) {
@@ -724,8 +862,6 @@ void *commander_ctrl(void *sock_p) {
 }
 
 int main(int argc, char *argv[]) {
-	pthread_t ptrace_ctrl_thread = 0;
-
 	{ /* initializating cleanup function */
 		if (atexit(cleanup)) {
 			log(LOG_EMERG, "Got error while atexit(): %s.\n", strerror(errno));
